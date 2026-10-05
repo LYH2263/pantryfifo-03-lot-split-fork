@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.fefo import consume_fefo, expire_lots
+from app.modules.repack import confirm_split, preview_split
 
 app = FastAPI(title="Pantryfifo", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -74,30 +75,84 @@ class ConsumeIn(BaseModel):
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
     c = connect()
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
+    # BEGIN IMMEDIATE: re-read and deduct inside one write transaction so an
+    # overlapping split/expire on the same lots can never deduct stale state.
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        lots = [dict(r) for r in c.execute(
+            "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
+        result = consume_fefo(lots, body.qty)
+        if result["ok"]:
+            for d in result["deductions"]:
+                c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
+                rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
+                if rem <= 0:
+                    c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
+            c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
+                      (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
+            c.commit()
+        else:
+            c.rollback()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
     if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
+        raise HTTPException(400, result["reason"])
     if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
-            c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+        raise HTTPException(409, result)
+    return result
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
     c = connect()
-    lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
-    ids = expire_lots(lots, date.today().isoformat())
-    for i in ids:
-        c.execute("UPDATE lots SET status='expired' WHERE id=?", (i,))
-    c.commit(); c.close(); return {"expired_ids": ids}
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
+        ids = expire_lots(lots, date.today().isoformat())
+        for i in ids:
+            c.execute("UPDATE lots SET status='expired' WHERE id=?", (i,))
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    return {"expired_ids": ids}
+
+class SplitIn(BaseModel):
+    lot_id: int
+    qty: float
+
+_SPLIT_STATUS = {"lot_not_found": 404, "qty_non_positive": 400}
+
+@app.post("/api/split/preview")
+def split_preview(body: SplitIn):
+    # read-only: always 200 with the plan; never touches lots
+    c = connect()
+    plan = preview_split(c, body.lot_id, body.qty)
+    c.close()
+    return plan
+
+@app.post("/api/split/confirm")
+def split_confirm(body: SplitIn):
+    c = connect()
+    try:
+        plan = confirm_split(c, body.lot_id, body.qty)
+    finally:
+        c.close()
+    if not plan["ok"]:
+        raise HTTPException(_SPLIT_STATUS.get(plan["reason"], 409), plan)
+    return plan
+
+@app.get("/api/consumptions")
+def consumptions():
+    # read-only history: reviewing past records never re-deducts any lot
+    c = connect()
+    rows = [dict(r) for r in c.execute("SELECT * FROM consumptions ORDER BY id DESC")]
+    c.close()
+    return rows
 
 @app.get("/api/settings")
 def settings():
