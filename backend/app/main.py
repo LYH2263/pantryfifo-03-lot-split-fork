@@ -6,9 +6,19 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.fefo import consume_fefo, expire_lots
+from app.engines.split import plan_split
 
 app = FastAPI(title="Pantryfifo", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# plan_split failure reason -> HTTP status code
+_SPLIT_STATUS = {
+    "lot_not_found": 404,
+    "lot_not_eligible": 409,
+    "split_qty_non_positive": 400,
+    "split_qty_exceeds_remain": 409,
+}
+
 
 @app.on_event("startup")
 def _startup(): seed.init_db()
@@ -28,6 +38,7 @@ def fridge(layer: str | None = None):
     args = []
     if layer:
         q += " AND items.layer=?"; args.append(layer)
+    q += " ORDER BY items.layer, lots.expiry, lots.id"
     rows = [dict(r) for r in c.execute(q, args)]; c.close(); return rows
 
 @app.get("/api/alerts")
@@ -74,21 +85,91 @@ class ConsumeIn(BaseModel):
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
     c = connect()
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
-    if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
-    if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
-            c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+    try:
+        # Pull every shelf row and let the engine apply the shared eligibility
+        # gate (positive remainder + clean), so dirty/negative rows can never
+        # silently enter FEFO picking here or anywhere else.
+        lots = [dict(r) for r in c.execute(
+            "SELECT * FROM lots WHERE item_id=? AND status='on_shelf'", (body.item_id,))]
+        result = consume_fefo(lots, body.qty)
+        if not result["ok"] and result["reason"] == "qty_non_positive":
+            raise HTTPException(400, result["reason"])
+        if not result["ok"]:
+            raise HTTPException(409, result)
+        for d in result["deductions"]:
+            c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
+            rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
+            if rem <= 0:
+                c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
+        c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
+                  (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
+        c.commit()
+        return result
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+class SplitIn(BaseModel):
+    lot_id: int
+    qty: float
+
+@app.post("/api/split")
+def split(body: SplitIn):
+    """Repack qty out of one on-shelf lot into a new child lot.
+
+    The whole order is atomic: if validation fails, or if the insert or the
+    mother decrement fails, nothing is committed — no child without a mother
+    and no mother decrement without its child. Quantity is conserved:
+    child + mother_remain == mother_remain_before.
+    """
+    c = connect()
+    try:
+        row = c.execute("SELECT * FROM lots WHERE id=?", (body.lot_id,)).fetchone()
+        lot = dict(row) if row else None
+        plan = plan_split(lot, body.qty)
+        if not plan["ok"]:
+            raise HTTPException(_SPLIT_STATUS[plan["reason"]], plan["reason"])
+
+        before = float(lot["qty_remain"])
+        cur = c.execute(
+            """INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality,parent_id)
+               VALUES (?,?,?,?,?,?,?)""",
+            (lot["item_id"], plan["child_qty"], plan["child_qty"], lot["expiry"],
+             "on_shelf", "clean", lot["id"]))
+        child_id = cur.lastrowid
+        # Conditional decrement: if the mother changed between read and write
+        # (concurrent consume/split/expire), rowcount is 0 -> rollback. The
+        # child insert above is then undone too, so no orphan can survive.
+        upd = c.execute(
+            "UPDATE lots SET qty_remain = qty_remain - ? WHERE id=? AND status='on_shelf' AND qty_remain=?",
+            (plan["child_qty"], lot["id"], before))
+        if upd.rowcount != 1:
+            raise HTTPException(409, "mother_changed")
+        # Post-condition the requirement demands: the mother must be reduced
+        # exactly when the child is shelved, and the sum must be unchanged.
+        check = c.execute(
+            "SELECT (SELECT qty_remain FROM lots WHERE id=?) + (SELECT qty_remain FROM lots WHERE id=?) AS total, "
+            "(SELECT qty_remain FROM lots WHERE id=?) AS mother",
+            (child_id, lot["id"], lot["id"])).fetchone()
+        if abs(float(check["total"]) - before) > 1e-6 or float(check["mother"]) <= 0:
+            raise HTTPException(500, "split_invariant_violated")
+        c.commit()
+        return {
+            "ok": True, "parent_id": lot["id"], "child_id": child_id,
+            "child_qty": plan["child_qty"],
+            "parent_remain": round(float(check["mother"]), 6),
+            "total": round(float(check["total"]), 6),
+        }
+    except HTTPException:
+        c.rollback()
+        raise
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
